@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import logging
-from typing import Callable
+from typing import Callable, Any, Optional
 from datetime import datetime, timedelta
 from threading import Timer
 import time
@@ -26,15 +26,6 @@ _LOGGER = logging.getLogger(__name__)
 
 TuyaBLELockIsAvailable = Callable[["TuyaBLELock", TuyaBLEProductInfo], bool] | None
 
-from typing import Any
-
-from homeassistant.const import (
-    STATE_LOCKED,
-    STATE_UNKNOWN,
-    STATE_UNLOCKED,
-    STATE_LOCKING,
-    STATE_UNLOCKING,
-)
 
 @dataclass
 class TuyaBLELockMapping:
@@ -49,6 +40,8 @@ class TuyaBLELockMapping:
     dp_type: TuyaBLEDataPointType | None = None
     is_available: TuyaBLELockIsAvailable = None
 
+
+# Сохраняем «вторую» декларацию, как в исходниках, — она лишь задаёт значения по умолчанию
 @dataclass
 class TuyaBLELockMapping(TuyaBLELockMapping):
     description: LockEntityDescription = field(
@@ -57,7 +50,8 @@ class TuyaBLELockMapping(TuyaBLELockMapping):
             translation_key="push",
         )
     )
-    is_available: TuyaBLELockIsAvailable = 0
+    is_available: TuyaBLELockIsAvailable = 0  # type: ignore[assignment]
+
 
 @dataclass
 class TuyaBLECategoryLockMapping:
@@ -79,13 +73,11 @@ mapping: dict[str, TuyaBLECategoryLockMapping] = {
                     dp_id_nop=52,
                     keep_connect=True,
                     keep_connect_timer=60,
-                    description=LockEntityDescription(
-                        key="manual_lock"
-                    ),
+                    description=LockEntityDescription(key="manual_lock"),
                 ),
             ]
         }
-    ), 
+    ),
 }
 
 
@@ -116,13 +108,21 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
     ) -> None:
         super().__init__(hass, coordinator, device, product, mapping.description)
         self._mapping = mapping
-        self._current_state = STATE_UNKNOWN
-        self._target_state = None
+
+        # Состояние замка:
+        #   True  -> locked
+        #   False -> unlocked
+        #   None  -> unknown
+        self._current_state: Optional[bool] = None
+        self._target_state: Optional[bool] = None
+
         self._commanded = False
-        self._commanded_timer = None
+        self._commanded_timer: Optional[datetime] = None
         self._datapoint_nop = None
         self._isjammed = False
+
         self._update_attrs()
+
         if mapping.keep_connect:
             self._thread = Timer(self._mapping.keep_connect_timer, self.send_nop_request)
             self._thread.start()
@@ -138,28 +138,28 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
                 self._hass.create_task(self._datapoint_nop.set_value(True))
             time.sleep(self._mapping.keep_connect_timer)
 
+    # ==== Стандартные свойства LockEntity (формируют LockState) ====
+
     @property
     def is_locked(self) -> bool | None:
         """Return true if device is locked."""
-        if self._current_state == STATE_UNKNOWN:
-            return None
-        return self._current_state == STATE_LOCKED
+        return self._current_state  # True/False/None как ожидает LockEntity
 
     @property
-    def is_locking(self) -> bool:
+    def is_locking(self) -> bool | None:
         """Return true if device is locking."""
         return (
-            self._current_state == STATE_UNLOCKED
-            and self._target_state == STATE_LOCKED
+            self._current_state is False
+            and self._target_state is True
             and self._commanded
         )
 
     @property
-    def is_unlocking(self) -> bool:
+    def is_unlocking(self) -> bool | None:
         """Return true if device is unlocking."""
         return (
-            self._current_state == STATE_LOCKED
-            and self._target_state == STATE_UNLOCKED
+            self._current_state is True
+            and self._target_state is False
             and self._commanded
         )
 
@@ -170,33 +170,33 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
 
     # Alarm properties
     @property
-    def should_poll(self) -> bool: return False
+    def should_poll(self) -> bool:
+        return False
 
     def _update_attrs(self) -> None:
+        # Эти атрибуты LockEntity читает напрямую, но можно и через properties
         self._attr_is_locking = self.is_locking
         self._attr_is_unlocking = self.is_unlocking
         self._attr_is_locked = self.is_locked
-        self._attr_is_unlocked = not self.is_locked
         self._attr_is_jammed = self.is_jammed
         self._attr_changed_by = super().changed_by
 
+    # ==== Команды ====
+
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock the device."""
-        await self._set_lock_state(STATE_LOCKED)
+        await self._set_lock_state(True)
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock the device."""
-        await self._set_lock_state(STATE_UNLOCKED)
+        await self._set_lock_state(False)
 
-    async def _set_lock_state(self, state: str) -> None:
-        self._target_state = state
+    async def _set_lock_state(self, want_locked: bool) -> None:
+        self._target_state = want_locked
         self._update_attrs()
         self.async_write_ha_state()
 
-        if self._target_state == STATE_UNLOCKED:
-            dp_id = self._mapping.dp_id_unlock
-        else:
-            dp_id = self._mapping.dp_id_lock
+        dp_id = self._mapping.dp_id_lock if want_locked else self._mapping.dp_id_unlock
 
         datapoint = self._device.datapoints.get_or_create(
             dp_id,
@@ -204,22 +204,25 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
             False,
         )
 
-        #Gimdow need true to activate lock/unlock commands
+        # Gimdow require True to activate lock/unlock commands
         self._hass.create_task(datapoint.set_value(True))
         self._commanded = True
         self._commanded_timer = datetime.now()
 
+    # ==== Обновление состояния с устройства ====
 
     def update_device_state(self):
         datapoint = self._device.datapoints[self._mapping.dp_id]
         if datapoint:
-            if datapoint.value:
-                self._current_state = STATE_UNLOCKED
-            else:
-                self._current_state = STATE_LOCKED
+            # По исходной логике: True -> UNLOCKED, False -> LOCKED
+            self._current_state = False if datapoint.value else True
+
             if self._commanded:
-                if ( self._current_state != self._target_state):
-                    if ( datetime.now() > self._commanded_timer + timedelta(seconds = 12) ):
+                if self._target_state is not None and self._current_state != self._target_state:
+                    # Если целевое состояние не достигнуто за разумное время — джэм
+                    if self._commanded_timer and (
+                        datetime.now() > self._commanded_timer + timedelta(seconds=12)
+                    ):
                         self._isjammed = True
                         self._commanded = False
                 else:
@@ -246,7 +249,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Tuya BLE sensors."""
+    """Set up the Tuya BLE locks."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
     entities: list[TuyaBLELock] = []
@@ -264,4 +267,3 @@ async def async_setup_entry(
                 )
             )
     async_add_entities(entities)
-
