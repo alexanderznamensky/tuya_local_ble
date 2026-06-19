@@ -1,294 +1,28 @@
-"""The Tuya BLE integration."""
+"""Select platform for Tuya Local BLE."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from typing import Any
 
-import logging
-
-from homeassistant.components.select import (
-    SelectEntityDescription,
-    SelectEntity,
-)
+from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import (
-    DOMAIN,
-    FINGERBOT_MODE_PROGRAM,
-    FINGERBOT_MODE_PUSH,
-    FINGERBOT_MODE_SWITCH,
-)
-from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
-from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
-
-_LOGGER = logging.getLogger(__name__)
+from .const import DOMAIN
+from .devices import TuyaBLEData, get_device_info
+from .tuya_ble import TuyaBLEDataPointType
 
 
-@dataclass
-class TuyaBLESelectMapping:
-    dp_id: int
-    description: SelectEntityDescription
-    force_add: bool = True
-    dp_type: TuyaBLEDataPointType | None = None
+LOCK_VOLUME_DP_ID = 31
 
-
-@dataclass
-class TemperatureUnitDescription(SelectEntityDescription):
-    key: str = "temperature_unit"
-    icon: str = "mdi:thermometer"
-    entity_category: EntityCategory = EntityCategory.CONFIG
-
-
-@dataclass
-class TuyaBLEFingerbotModeMapping(TuyaBLESelectMapping):
-    description: SelectEntityDescription = field(
-        default_factory=lambda: SelectEntityDescription(
-            key="fingerbot_mode",
-            entity_category=EntityCategory.CONFIG,
-            options=
-                [
-                    FINGERBOT_MODE_PUSH, 
-                    FINGERBOT_MODE_SWITCH,
-                    FINGERBOT_MODE_PROGRAM,
-                ],
-        )
-    )
-
-
-@dataclass
-class TuyaBLECategorySelectMapping:
-    products: dict[str, list[TuyaBLESelectMapping]] | None = None
-    mapping: list[TuyaBLESelectMapping] | None = None
-
-
-mapping: dict[str, TuyaBLECategorySelectMapping] = {
-    "co2bj": TuyaBLECategorySelectMapping(
-        products={
-            "59s19z5m":  # CO2 Detector
-            [
-                TuyaBLESelectMapping(
-                    dp_id=101,
-                    description=TemperatureUnitDescription(
-                        options=[
-                            UnitOfTemperature.CELSIUS,
-                            UnitOfTemperature.FAHRENHEIT,
-                        ],
-                    )
-                ),
-            ],
-        },
-    ),
-    "ms": TuyaBLECategorySelectMapping(
-        products={
-            **dict.fromkeys(
-                ["ludzroix", "isk2p555"], # Smart Lock
-                [
-                    TuyaBLESelectMapping(
-                        dp_id=31,
-                        description=SelectEntityDescription(
-                            key="beep_volume",
-                            options=[
-                                "mute",
-                                "low",
-                                "normal",
-                                "high",
-                            ],
-                            entity_category=EntityCategory.CONFIG,
-                        ),
-                    ),
-                ]
-            ),
-        }
-    ),
-    "jtmspro": TuyaBLECategorySelectMapping(
-        products={
-            "rlyxv7pe":  # Smart Lock
-            [
-                TuyaBLESelectMapping(
-                    dp_id=31,
-                    description=SelectEntityDescription(
-                        key="beep_volume",
-                        options=[
-                            "mute",
-                            "low",
-                            "normal",
-                            "high",
-                        ],
-                        entity_category=EntityCategory.CONFIG,
-                    ),
-                ),
-            ]
-        }
-    ),    
-    "szjqr": TuyaBLECategorySelectMapping(
-        products={
-            **dict.fromkeys(
-                ["3yqdo5yt", "xhf790if"],  # CubeTouch 1s and II
-                [
-                    TuyaBLEFingerbotModeMapping(dp_id=2),
-                ],
-            ),
-            **dict.fromkeys(
-                [
-                    "blliqpsj",
-                    "ndvkgsrm",
-                    "yiihr7zh", 
-                    "neq16kgd"
-                ],  # Fingerbot Plus
-                [
-                    TuyaBLEFingerbotModeMapping(dp_id=8),
-                ],
-            ),
-            **dict.fromkeys(
-                ["ltak7e1p", "y6kttvd6", "yrnk7mnn",
-                    "nvr2rocq", "bnt7wajf", "rvdceqjh",
-                    "5xhbk964"],  # Fingerbot
-                [
-                    TuyaBLEFingerbotModeMapping(dp_id=8),
-                ],
-            ),
-        },
-    ),
-    "wsdcg": TuyaBLECategorySelectMapping(
-        products={
-            "ojzlzzsw":  # Soil moisture sensor
-            [
-                TuyaBLESelectMapping(
-                    dp_id=9,
-                    description=TemperatureUnitDescription(
-                        options=[
-                            UnitOfTemperature.CELSIUS,
-                            UnitOfTemperature.FAHRENHEIT,
-                        ],
-                        entity_registry_enabled_default=False,
-                    )
-                ),
-            ],
-        },
-    ),
-    "znhsb": TuyaBLECategorySelectMapping(
-        products={
-            "cdlandip":  # Smart water bottle
-            [
-                TuyaBLESelectMapping(
-                    dp_id=106,
-                    description=TemperatureUnitDescription(
-                        options=[
-                            UnitOfTemperature.CELSIUS,
-                            UnitOfTemperature.FAHRENHEIT,
-                        ],
-                    )
-                ),
-                TuyaBLESelectMapping(
-                    dp_id=107,
-                    description=SelectEntityDescription(
-                        key="reminder_mode",
-                        options=[
-                            "interval_reminder",
-                            "schedule_reminder",
-                        ],
-                        entity_category=EntityCategory.CONFIG,
-                    ),
-                ),
-            ],
-        },
-    ),
-    "znhsb": TuyaBLECategorySelectMapping(
-        products={
-            "cdlandip":  # Smart water bottle
-            [
-                TuyaBLESelectMapping(
-                    dp_id=106,
-                    description=TemperatureUnitDescription(
-                        options=[
-                            UnitOfTemperature.CELSIUS,
-                            UnitOfTemperature.FAHRENHEIT,
-                        ],
-                    )
-                ),
-                TuyaBLESelectMapping(
-                    dp_id=107,
-                    description=SelectEntityDescription(
-                        key="reminder_mode",
-                        options=[
-                            "interval_reminder",
-                            "alarm_reminder",
-                        ],
-                        entity_category=EntityCategory.CONFIG,
-                    ),
-                ),
-            ],
-        },
-    ),
-}
-
-
-def get_mapping_by_device(
-    device: TuyaBLEDevice
-) -> list[TuyaBLECategorySelectMapping]:
-    category = mapping.get(device.category)
-    if category is not None and category.products is not None:
-        product_mapping = category.products.get(device.product_id)
-        if product_mapping is not None:
-            return product_mapping
-        if category.mapping is not None:
-            return category.mapping
-        else:
-            return []
-    else:
-        return []
-
-
-class TuyaBLESelect(TuyaBLEEntity, SelectEntity):
-    """Representation of a Tuya BLE select."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        coordinator: DataUpdateCoordinator,
-        device: TuyaBLEDevice,
-        product: TuyaBLEProductInfo,
-        mapping: TuyaBLESelectMapping,
-    ) -> None:
-        super().__init__(
-            hass,
-            coordinator,
-            device,
-            product,
-            mapping.description
-        )
-        self._mapping = mapping
-        self._attr_options = mapping.description.options
-
-    @property
-    def current_option(self) -> str | None:
-        """Return the selected entity option to represent the entity state."""
-        # Raw value
-        value: str | None = None
-        datapoint = self._device.datapoints[self._mapping.dp_id]
-        if datapoint:
-            value = datapoint.value
-            if value >= 0 and value < len(self._attr_options):
-                return self._attr_options[value]
-            else:
-                return value
-        return None
-
-    def select_option(self, value: str) -> None:
-        """Change the selected option."""
-        if value in self._attr_options:
-            int_value = self._attr_options.index(value)
-            datapoint = self._device.datapoints.get_or_create(
-                self._mapping.dp_id,
-                TuyaBLEDataPointType.DT_ENUM,
-                int_value,
-            )
-            if datapoint:
-                self._hass.create_task(datapoint.set_value(int_value))
+LOCK_VOLUME_OPTIONS: list[str] = [
+    "mute",
+    "low",
+    "normal",
+    "high",
+]
 
 
 async def async_setup_entry(
@@ -296,20 +30,77 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Tuya BLE sensors."""
+    """Set up Tuya Local BLE select entities."""
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
-    mappings = get_mapping_by_device(data.device)
-    entities: list[TuyaBLESelect] = []
-    for mapping in mappings:
-        if (
-            mapping.force_add or
-            data.device.datapoints.has_id(mapping.dp_id, mapping.dp_type)
-        ):
-            entities.append(TuyaBLESelect(
-                hass,
-                data.coordinator,
-                data.device,
-                data.product,
-                mapping,
-            ))
-    async_add_entities(entities)
+
+    async_add_entities(
+        [
+            TuyaBLELockVolumeSelect(data),
+        ]
+    )
+
+
+class TuyaBLELockVolumeSelect(CoordinatorEntity, SelectEntity):
+    """Lock volume select."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Lock Volume"
+    _attr_icon = "mdi:volume-high"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = LOCK_VOLUME_OPTIONS
+
+    def __init__(self, data: TuyaBLEData) -> None:
+        super().__init__(data.coordinator)
+        self._data = data
+        self._attr_unique_id = f"{data.device.device_id}-beep_volume"
+        self._attr_device_info = get_device_info(data.device)
+
+        data.device.datapoints.get_or_create(
+            LOCK_VOLUME_DP_ID,
+            TuyaBLEDataPointType.DT_ENUM,
+            0,
+        )
+
+    @property
+    def current_option(self) -> str | None:
+        """Return current selected option."""
+        datapoint = self._data.device.datapoints[LOCK_VOLUME_DP_ID]
+
+        if datapoint is None:
+            return None
+
+        value: Any = datapoint.value
+
+        if isinstance(value, bytes):
+            value = int.from_bytes(value, "big")
+
+        if isinstance(value, bool):
+            value = int(value)
+
+        if isinstance(value, int):
+            if 0 <= value < len(LOCK_VOLUME_OPTIONS):
+                return LOCK_VOLUME_OPTIONS[value]
+            return str(value)
+
+        return str(value)
+
+    async def async_select_option(self, option: str) -> None:
+        """Change lock volume."""
+        if option not in LOCK_VOLUME_OPTIONS:
+            return
+
+        int_value = LOCK_VOLUME_OPTIONS.index(option)
+
+        datapoint = self._data.device.datapoints.get_or_create(
+            LOCK_VOLUME_DP_ID,
+            TuyaBLEDataPointType.DT_ENUM,
+            int_value,
+        )
+
+        await datapoint.set_value(int_value)
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Return availability."""
+        return True
