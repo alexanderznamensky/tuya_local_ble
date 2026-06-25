@@ -221,6 +221,7 @@ class TuyaBLEDevice:
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
         self._operation_lock = asyncio.Lock()
+        self._transaction_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._expected_disconnect = False
@@ -500,6 +501,7 @@ class TuyaBLEDevice:
             )
             return
         self._client = None
+        self._abort_pending_responses("BLE device unexpectedly disconnected")
         _LOGGER.debug(
             "%s: Device unexpectedly disconnected; RSSI: %s",
             self.address,
@@ -525,6 +527,14 @@ class TuyaBLEDevice:
         )
         await self._execute_disconnect()
 
+    def _abort_pending_responses(self, reason: str) -> None:
+        """Clear partial input and fail pending request/response waits."""
+        self._clean_input()
+        for future in list(self._input_expected_responses.values()):
+            if future and not future.done():
+                future.set_exception(BleakError(reason))
+        self._input_expected_responses.clear()
+
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
         async with self._connect_lock:
@@ -536,6 +546,7 @@ class TuyaBLEDevice:
                 await client.disconnect()
         async with self._seq_num_lock:
             self._current_seq_num = 1
+        self._abort_pending_responses("Disconnected from BLE device")
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
@@ -831,11 +842,41 @@ class TuyaBLEDevice:
         # retry: int | None = None
     ) -> bool:
         """Send packet to device and optional read response."""
+        if wait_for_response:
+            async with self._transaction_lock:
+                return await self._send_packet_while_connected_locked(
+                    code,
+                    data,
+                    response_to,
+                    wait_for_response,
+                )
+
+        return await self._send_packet_while_connected_locked(
+            code,
+            data,
+            response_to,
+            wait_for_response,
+        )
+
+    async def _send_packet_while_connected_locked(
+        self,
+        code: TuyaBLECode,
+        data: bytes,
+        response_to: int,
+        wait_for_response: bool,
+    ) -> bool:
+        """Send packet to device and wait for its matching response when needed."""
         result = True
         future: asyncio.Future | None = None
+
+        if wait_for_response:
+            # Drop any unfinished notification frame from a previous timed-out
+            # command before starting a new request/response transaction.
+            self._clean_input()
+
         seq_num = await self._get_seq_num()
         if wait_for_response:
-            future = asyncio.Future()
+            future = asyncio.get_running_loop().create_future()
             self._input_expected_responses[seq_num] = future
 
         if response_to > 0:
@@ -853,9 +894,10 @@ class TuyaBLEDevice:
                 seq_num,
                 code.name,
             )
-        packets: list[bytes] = self._build_packets(
-            seq_num, code, data, response_to)
+
+        packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
         await self._int_send_packet_while_connected(packets)
+
         if future:
             try:
                 await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
@@ -866,7 +908,9 @@ class TuyaBLEDevice:
                     self.rssi,
                 )
                 result = False
-            self._input_expected_responses.pop(seq_num, None)
+            finally:
+                self._input_expected_responses.pop(seq_num, None)
+                self._clean_input()
 
         return result
 
@@ -1238,49 +1282,54 @@ class TuyaBLEDevice:
         """Handle notification responses."""
         _LOGGER.debug("%s: Packet received: %s", self.address, data.hex())
 
-        pos: int = 0
-        packet_num: int
+        try:
+            pos: int = 0
+            packet_num, pos = self._unpack_int(data, pos)
 
-        packet_num, pos = self._unpack_int(data, pos)
-
-        if packet_num < self._input_expected_packet_num:
-            _LOGGER.error(
-                "%s: Unexpcted packet (number %s) in notifications, " "expected %s",
-                self.address,
-                packet_num,
-                self._input_expected_packet_num,
-            )
-            self._clean_input()
-
-        if packet_num == self._input_expected_packet_num:
             if packet_num == 0:
+                # A packet with number 0 always starts a new BLE notification frame.
+                # This prevents stale/partial frames from poisoning the next response.
                 self._input_buffer = bytearray()
                 self._input_expected_length, pos = self._unpack_int(data, pos)
                 pos += 1
-            self._input_buffer += data[pos:]
-            self._input_expected_packet_num += 1
-        else:
-            _LOGGER.error(
-                "%s: Missing packet (number %s) in notifications, received %s",
-                self.address,
-                self._input_expected_packet_num,
-                packet_num,
-            )
-            self._clean_input()
-            return
+                self._input_buffer += data[pos:]
+                self._input_expected_packet_num = 1
+            elif (
+                self._input_buffer is not None
+                and packet_num == self._input_expected_packet_num
+            ):
+                self._input_buffer += data[pos:]
+                self._input_expected_packet_num += 1
+            else:
+                _LOGGER.debug(
+                    "%s: Ignoring out-of-order notification packet %s, expected %s",
+                    self.address,
+                    packet_num,
+                    self._input_expected_packet_num,
+                )
+                if packet_num > self._input_expected_packet_num:
+                    self._clean_input()
+                return
 
-        if len(self._input_buffer) > self._input_expected_length:
-            _LOGGER.error(
-                "%s: Unexpcted length of data in notifications, "
-                "received %s expected %s",
-                self.address,
-                len(self._input_buffer),
-                self._input_expected_length,
-            )
+            if self._input_buffer is None:
+                return
+
+            if len(self._input_buffer) > self._input_expected_length:
+                _LOGGER.error(
+                    "%s: Unexpected length of data in notifications, "
+                    "received %s expected %s",
+                    self.address,
+                    len(self._input_buffer),
+                    self._input_expected_length,
+                )
+                self._clean_input()
+                return
+
+            if len(self._input_buffer) == self._input_expected_length:
+                self._parse_input()
+        except Exception:
+            _LOGGER.error("%s: Error handling notification", self.address, exc_info=True)
             self._clean_input()
-            return
-        elif len(self._input_buffer) == self._input_expected_length:
-            self._parse_input()
 
     async def _send_datapoints_v3(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""
