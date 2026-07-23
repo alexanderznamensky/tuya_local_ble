@@ -111,7 +111,7 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
             # Спящие BLE-замки часто недоступны между рекламными пакетами.
             # Не отправляем NOP, пока устройство не подключено/не paired, иначе
             # Home Assistant получает "Task exception was never retrieved".
-            if not self.coordinator.connected or not self._datapoint_nop:
+            if not self._device.is_connected or not self._datapoint_nop:
                 return
             try:
                 await self._datapoint_nop.set_value(True)

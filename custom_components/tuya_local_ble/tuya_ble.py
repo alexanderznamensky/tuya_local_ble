@@ -10,7 +10,6 @@ from struct import pack, unpack
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak.exc import BleakDBusError
 from bleak_retry_connector import BLEAK_BACKOFF_TIME
 from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS
 from bleak_retry_connector import (
@@ -44,6 +43,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
+
+# Tuya packets are fragmented into 20-byte GATT writes. A short pause between
+# write-without-response operations prevents overrunning slower lock firmware.
+INTER_PACKET_DELAY = 0.02
+SEND_RETRY_ATTEMPTS = 2
 
 
 class TuyaBLEDataPoint:
@@ -421,6 +425,12 @@ class TuyaBLEDevice:
         """Get datapoints exposed by device."""
         return self._datapoints
 
+    @property
+    def is_connected(self) -> bool:
+        """Return whether the current BLE client is connected and paired."""
+        client = self._client
+        return bool(client and client.is_connected and self._is_paired)
+
     def get_or_create_datapoint(
         self,
         id: int,
@@ -488,11 +498,51 @@ class TuyaBLEDevice:
         _LOGGER.debug("%s: Stop", self.address)
         await self._execute_disconnect()
 
-    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
-        """Disconnected callback."""
-        was_paired = self._is_paired
+    def _invalidate_connection(
+        self,
+        reason: str,
+        client: BleakClientWithServiceCache | None = None,
+    ) -> bool:
+        """Clear a failed connection without allowing stale callbacks to win."""
+        current = self._client
+        if client is not None and current is not None and client is not current:
+            _LOGGER.debug(
+                "%s: Ignoring stale disconnect for an old BLE client",
+                self.address,
+            )
+            return False
+
+        had_connection = current is not None or self._is_paired
+        self._client = None
         self._is_paired = False
-        self._fire_disconnected_callbacks()
+        self._abort_pending_responses(reason)
+        if had_connection:
+            self._fire_disconnected_callbacks()
+        return had_connection
+
+    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
+        """Handle a BlueZ/Bleak disconnection callback."""
+        # A callback from a client that was already invalidated must not clear a
+        # newer connection established in the meantime.
+        if self._client is None:
+            _LOGGER.debug(
+                "%s: Disconnect callback received after client state was cleared",
+                self.address,
+            )
+            return
+        if client is not self._client:
+            _LOGGER.debug(
+                "%s: Ignoring disconnect callback from a stale BLE client",
+                self.address,
+            )
+            return
+
+        was_paired = self._is_paired
+        self._invalidate_connection(
+            "BLE device unexpectedly disconnected",
+            client,
+        )
+
         if self._expected_disconnect:
             _LOGGER.debug(
                 "%s: Disconnected from device; RSSI: %s",
@@ -500,8 +550,7 @@ class TuyaBLEDevice:
                 self.rssi,
             )
             return
-        self._client = None
-        self._abort_pending_responses("BLE device unexpectedly disconnected")
+
         _LOGGER.debug(
             "%s: Device unexpectedly disconnected; RSSI: %s",
             self.address,
@@ -521,10 +570,7 @@ class TuyaBLEDevice:
 
     async def _execute_timed_disconnect(self) -> None:
         """Execute timed disconnection."""
-        _LOGGER.debug(
-            "%s: Disconnecting",
-            self.address,
-        )
+        _LOGGER.debug("%s: Disconnecting", self.address)
         await self._execute_disconnect()
 
     def _abort_pending_responses(self, reason: str) -> None:
@@ -533,20 +579,37 @@ class TuyaBLEDevice:
         for future in list(self._input_expected_responses.values()):
             if future and not future.done():
                 future.set_exception(BleakError(reason))
+                # Mark the exception as retrieved even when the write failed
+                # before the sending coroutine reached `await future`. Awaiters
+                # still receive the same exception.
+                future.exception()
         self._input_expected_responses.clear()
 
     async def _execute_disconnect(self) -> None:
-        """Execute disconnection."""
+        """Execute the final integration shutdown disconnection."""
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True
-            self._client = None
+            self._invalidate_connection("Disconnected from BLE device", client)
             if client and client.is_connected:
-                await client.stop_notify(CHARACTERISTIC_NOTIFY)
-                await client.disconnect()
+                try:
+                    await client.stop_notify(CHARACTERISTIC_NOTIFY)
+                except BLEAK_EXCEPTIONS:
+                    _LOGGER.debug(
+                        "%s: stop_notify failed during shutdown",
+                        self.address,
+                        exc_info=True,
+                    )
+                try:
+                    await client.disconnect()
+                except BLEAK_EXCEPTIONS:
+                    _LOGGER.debug(
+                        "%s: disconnect failed during shutdown",
+                        self.address,
+                        exc_info=True,
+                    )
         async with self._seq_num_lock:
             self._current_seq_num = 1
-        self._abort_pending_responses("Disconnected from BLE device")
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
@@ -813,15 +876,39 @@ class TuyaBLEDevice:
         code: TuyaBLECode,
         data: bytes,
         wait_for_response: bool = True,
-        # retry: int | None = None,
     ) -> None:
-        """Send packet to device and optional read response."""
+        """Send a logical Tuya command, reconnecting and rebuilding once."""
         if self._expected_disconnect:
             return
-        await self._ensure_connected()
-        if self._expected_disconnect:
-            return
-        await self._send_packet_while_connected(code, data, 0, wait_for_response)
+
+        for attempt in range(SEND_RETRY_ATTEMPTS):
+            try:
+                await self._ensure_connected()
+                if self._expected_disconnect:
+                    return
+                if not self.is_connected:
+                    raise BleakError("BLE client is not connected and paired")
+                await self._send_packet_while_connected(
+                    code, data, 0, wait_for_response
+                )
+                return
+            except BLEAK_EXCEPTIONS as err:
+                self._invalidate_connection(
+                    f"BLE command {code.name} failed: {err}",
+                    self._client,
+                )
+                if attempt + 1 >= SEND_RETRY_ATTEMPTS:
+                    raise
+                _LOGGER.debug(
+                    "%s: Retrying logical command %s after connection reset "
+                    "(%s/%s); RSSI: %s",
+                    self.address,
+                    code.name,
+                    attempt + 1,
+                    SEND_RETRY_ATTEMPTS - 1,
+                    self.rssi,
+                )
+                await asyncio.sleep(BLEAK_BACKOFF_TIME)
 
     async def _send_response(
         self,
@@ -829,8 +916,8 @@ class TuyaBLEDevice:
         data: bytes,
         response_to: int,
     ) -> None:
-        """Send response to received packet."""
-        if self._client and self._client.is_connected:
+        """Send response to received packet while the same session is active."""
+        if self.is_connected:
             await self._send_packet_while_connected(code, data, response_to, False)
 
     async def _send_packet_while_connected(
@@ -839,23 +926,16 @@ class TuyaBLEDevice:
         data: bytes,
         response_to: int,
         wait_for_response: bool,
-        # retry: int | None = None
     ) -> bool:
-        """Send packet to device and optional read response."""
+        """Send packet to device and optionally wait for its response."""
         if wait_for_response:
             async with self._transaction_lock:
                 return await self._send_packet_while_connected_locked(
-                    code,
-                    data,
-                    response_to,
-                    wait_for_response,
+                    code, data, response_to, wait_for_response
                 )
 
         return await self._send_packet_while_connected_locked(
-            code,
-            data,
-            response_to,
-            wait_for_response,
+            code, data, response_to, wait_for_response
         )
 
     async def _send_packet_while_connected_locked(
@@ -865,13 +945,11 @@ class TuyaBLEDevice:
         response_to: int,
         wait_for_response: bool,
     ) -> bool:
-        """Send packet to device and wait for its matching response when needed."""
+        """Send one logical packet transaction on the current BLE session."""
         result = True
-        future: asyncio.Future | None = None
+        future: asyncio.Future[int] | None = None
 
         if wait_for_response:
-            # Drop any unfinished notification frame from a previous timed-out
-            # command before starting a new request/response transaction.
             self._clean_input()
 
         seq_num = await self._get_seq_num()
@@ -895,21 +973,31 @@ class TuyaBLEDevice:
                 code.name,
             )
 
-        packets: list[bytes] = self._build_packets(seq_num, code, data, response_to)
-        await self._int_send_packet_while_connected(packets)
+        packets = self._build_packets(seq_num, code, data, response_to)
+        try:
+            await self._int_send_packet_while_connected(packets)
 
-        if future:
-            try:
-                await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
-            except asyncio.TimeoutError:
-                _LOGGER.error(
-                    "%s: timeout receiving response, RSSI: %s",
-                    self.address,
-                    self.rssi,
-                )
-                result = False
-            finally:
+            if future is not None:
+                try:
+                    await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
+                except TimeoutError:
+                    _LOGGER.debug(
+                        "%s: Timeout receiving response to %s; RSSI: %s",
+                        self.address,
+                        code.name,
+                        self.rssi,
+                    )
+                    result = False
+        finally:
+            if wait_for_response:
                 self._input_expected_responses.pop(seq_num, None)
+                if future is not None and future.done() and not future.cancelled():
+                    # Retrieve a possible disconnect exception when the GATT write
+                    # failed before this coroutine started awaiting the future.
+                    try:
+                        future.exception()
+                    except asyncio.CancelledError:
+                        pass
                 self._clean_input()
 
         return result
@@ -920,98 +1008,53 @@ class TuyaBLEDevice:
     ) -> None:
         if self._operation_lock.locked():
             _LOGGER.debug(
-                "%s: Operation already in progress, "
-                "waiting for it to complete; RSSI: %s",
+                "%s: Operation already in progress, waiting for it to complete; "
+                "RSSI: %s",
                 self.address,
                 self.rssi,
             )
         async with self._operation_lock:
-            try:
-                await self._send_packets_locked(packets)
-            except BleakNotFoundError:
-                _LOGGER.error(
-                    "%s: device not found, no longer in range, or poor RSSI: %s",
-                    self.address,
-                    self.rssi,
-                    exc_info=True,
-                )
-                raise
-            except BLEAK_EXCEPTIONS:
-                _LOGGER.error(
-                    "%s: communication failed",
-                    self.address,
-                    exc_info=True,
-                )
-                raise
-
-    async def _resend_packets(self, packets: list[bytes]) -> None:
-        if self._expected_disconnect:
-            return
-        await self._ensure_connected()
-        if self._expected_disconnect:
-            return
-        await self._int_send_packet_while_connected(packets)
+            await self._send_packets_locked(packets)
 
     async def _send_packets_locked(self, packets: list[bytes]) -> None:
-        """Send command to device and read response."""
-        try:
-            await self._int_send_packets_locked(packets)
-        except BleakDBusError as ex:
-            # Disconnect so we can reset state and try again
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            _LOGGER.debug(
-                "%s: RSSI: %s; Backing off %ss; Disconnecting due to error: %s",
-                self.address,
-                self.rssi,
-                BLEAK_BACKOFF_TIME,
-                ex,
-            )
-            if self._is_paired:
-                asyncio.create_task(self._resend_packets(packets))
-            else:
-                asyncio.create_task(self._reconnect())
-            raise BleakError from ex
-        except BleakError as ex:
-            # Disconnect so we can reset state and try again
-            _LOGGER.debug(
-                "%s: RSSI: %s; Disconnecting due to error: %s",
-                self.address,
-                self.rssi,
-                ex,
-            )
-            if self._is_paired:
-                asyncio.create_task(self._resend_packets(packets))
-            else:
-                asyncio.create_task(self._reconnect())
-            raise
+        """Write all fragments using the current BLE session only."""
+        await self._int_send_packets_locked(packets)
 
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
-        """Execute command and read response."""
-        for packet in packets:
-            if self._client:
-                try:
-                    # _LOGGER.debug("%s: Sending packet: %s", self.address, packet.hex())
-                    await self._client.write_gatt_char(
-                        CHARACTERISTIC_WRITE,
-                        packet,
-                        False,
-                    )
-                except:
-                    _LOGGER.error(
-                        "%s: Error during sending packet",
-                        self.address,
-                        exc_info=True,
-                    )
-                    if self._client and self._client.is_connected:
-                        self._disconnected(self._client)
-                    raise BleakError()
-            else:
-                _LOGGER.error(
-                    "%s: Client disconnected during sending packet",
-                    self.address,
-                    exc_info=True,
+        """Write fragmented Tuya data with pacing and strict client identity."""
+        client = self._client
+        if client is None or not client.is_connected:
+            self._invalidate_connection(
+                "BLE client disconnected before packet send", client
+            )
+            raise BleakError("BLE client disconnected before packet send")
+
+        for index, packet in enumerate(packets):
+            if self._client is not client or not client.is_connected:
+                self._invalidate_connection(
+                    "BLE client disconnected during packet send", client
                 )
-                raise BleakError()
+                raise BleakError("BLE client disconnected during packet send")
+
+            try:
+                await client.write_gatt_char(
+                    CHARACTERISTIC_WRITE,
+                    packet,
+                    False,
+                )
+            except BLEAK_EXCEPTIONS as err:
+                self._invalidate_connection(
+                    f"GATT write failed: {err}", client
+                )
+                raise
+            except Exception as err:
+                self._invalidate_connection(
+                    f"Unexpected GATT write failure: {err}", client
+                )
+                raise BleakError("Unexpected GATT write failure") from err
+
+            if index + 1 < len(packets):
+                await asyncio.sleep(INTER_PACKET_DELAY)
 
     def _get_key(self, security_flag: int) -> bytes:
         if security_flag == 1:
