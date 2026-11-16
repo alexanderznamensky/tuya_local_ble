@@ -1,7 +1,9 @@
 """Tuya Local BLE integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 from bleak.backends.device import BLEDevice
 
@@ -17,6 +19,8 @@ from .keyman import HASSTuyaBLEDeviceManager
 from .tuya_ble import TuyaBLEDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+DISCOVERY_UPDATE_MIN_INTERVAL = 30.0
 
 PLATFORMS: list[Platform] = [
     Platform.LOCK,
@@ -66,36 +70,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     product_info = get_device_product_info(device)
     coordinator = TuyaBLECoordinator(hass, device, entry)
 
+    last_update_started = 0.0
+
     async def _async_try_device_update(reason: str) -> None:
         try:
             await device.update()
+        except asyncio.CancelledError:
+            raise
         except Exception:
             _LOGGER.debug(
-                "%s: device update failed after %s",
-                address,
-                reason,
+                "%s: device update failed after %s", address, reason,
                 exc_info=True,
             )
+
+    @callback
+    def _schedule_update(reason: str) -> None:
+        nonlocal last_update_started
+        if device._expected_disconnect:
+            return
+        task = device._discovery_update_task
+        if task is not None and not task.done():
+            return
+        now = time.monotonic()
+        if now - last_update_started < DISCOVERY_UPDATE_MIN_INTERVAL:
+            return
+        last_update_started = now
+        device._discovery_update_task = hass.async_create_task(
+            _async_try_device_update(reason)
+        )
 
     @callback
     def _async_update_ble(
         service_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """Update the BLE device reference when Home Assistant sees the sleeping lock."""
-        _LOGGER.debug(
-            "%s: Bluetooth advertisement received; refreshing BLE device reference",
-            address,
-        )
-
+        """Refresh BLE reference without queueing duplicate status requests."""
         device.set_ble_device_and_advertisement_data(
-            service_info.device,
-            service_info.advertisement,
+            service_info.device, service_info.advertisement,
         )
-
-        hass.async_create_task(
-            _async_try_device_update("bluetooth discovery")
-        )
+        _schedule_update("bluetooth discovery")
 
     entry.async_on_unload(
         bluetooth.async_register_callback(
@@ -121,9 +134,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     if device_was_found:
-        hass.async_create_task(
-            _async_try_device_update("initial setup")
-        )
+        _schedule_update("initial setup")
 
     async def _async_stop(event: Event) -> None:
         await device.stop()

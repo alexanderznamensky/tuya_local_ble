@@ -5,6 +5,7 @@ import hashlib
 import logging
 import secrets
 import time
+from weakref import WeakSet
 from collections.abc import Callable
 from struct import pack, unpack
 
@@ -48,6 +49,9 @@ BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
 # write-without-response operations prevents overrunning slower lock firmware.
 INTER_PACKET_DELAY = 0.02
 SEND_RETRY_ATTEMPTS = 2
+CONNECT_ATTEMPTS = 3
+CONNECT_RETRY_DELAY = 3.0
+DISCONNECT_TIMEOUT = 10.0
 
 
 class TuyaBLEDataPoint:
@@ -229,6 +233,24 @@ class TuyaBLEDevice:
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._expected_disconnect = False
+        # BLE_DIAG: monotonic identifiers are scoped to this integration instance.
+        self._ble_diag_next_session = 0
+        self._ble_diag_notify_registrations = 0
+        self._ble_diag_active_session: int | None = None
+        self._ble_diag_sessions: dict[int, dict] = {}
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._discovery_update_task: asyncio.Task[None] | None = None
+        # Track BlueZ D-Bus cleanup independently of the current BLE client.
+        # A physical disconnect does not necessarily close Bleak's D-Bus bus.
+        self._client_close_tasks: dict[
+            BleakClientWithServiceCache, asyncio.Task[None]
+        ] = {}
+        self._disconnect_cleanup_tasks: set[asyncio.Task[None]] = set()
+        # Remember buses already closed successfully without retaining clients.
+        self._closed_ble_clients: WeakSet[BleakClientWithServiceCache] = WeakSet()
+        self._scheduled_client_cleanups: dict[
+            BleakClientWithServiceCache, asyncio.Task[None]
+        ] = {}
         self._connected_callbacks: list[Callable[[], None]] = []
         self._callbacks: list[Callable[[list[TuyaBLEDataPoint]], None]] = []
         self._disconnected_callbacks: list[Callable[[], None]] = []
@@ -496,7 +518,18 @@ class TuyaBLEDevice:
     async def stop(self) -> None:
         """Stop the TuyaBLE."""
         _LOGGER.debug("%s: Stop", self.address)
+        self._expected_disconnect = True
+        for task in (self._reconnect_task, self._discovery_update_task):
+            if task is not None and not task.done():
+                task.cancel()
         await self._execute_disconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Run at most one reconnect worker per lock."""
+        if self._expected_disconnect:
+            return
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.create_task(self._reconnect())
 
     def _invalidate_connection(
         self,
@@ -516,53 +549,174 @@ class TuyaBLEDevice:
         self._client = None
         self._is_paired = False
         self._abort_pending_responses(reason)
+        # Some GATT write/error paths invalidate the client BEFORE BlueZ calls
+        # _disconnected(). Never lose the only reference to its D-Bus bus.
+        # During explicit shutdown, _execute_disconnect() closes it itself
+        # after the optional StopNotify call.
+        if current is not None and not self._expected_disconnect:
+            self._schedule_client_cleanup(current, reason)
         if had_connection:
             self._fire_disconnected_callbacks()
         return had_connection
 
-    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
-        """Handle a BlueZ/Bleak disconnection callback."""
-        # A callback from a client that was already invalidated must not clear a
-        # newer connection established in the meantime.
-        if self._client is None:
-            _LOGGER.debug(
-                "%s: Disconnect callback received after client state was cleared",
-                self.address,
+    def _ble_diag_register_notify(self, client: BleakClientWithServiceCache):
+        """Create a traceable callback per GATT subscription (diagnostics only).
+
+        No packets are discarded or modified by this wrapper. Session ids identify
+        each registration, even if the same BleakClient object is reused.
+        """
+        self._ble_diag_next_session += 1
+        session = self._ble_diag_next_session
+        self._ble_diag_notify_registrations += 1
+        stats = {
+            "calls": 0,
+            "duplicates": 0,
+            "stale": 0,
+            "last_payload": None,
+            "last_time": 0.0,
+            "client_id": f"0x{id(client):x}",
+        }
+        self._ble_diag_sessions[session] = stats
+        self._ble_diag_active_session = session
+        _LOGGER.warning(
+            "%s: BLE_DIAG notify REGISTER session=%s client=%s "
+            "total_registrations=%s",
+            self.address, session, stats["client_id"],
+            self._ble_diag_notify_registrations,
+        )
+
+        def traced_notification(sender: int, data: bytearray) -> None:
+            stats["calls"] += 1
+            now = time.monotonic()
+            payload = bytes(data)
+            duplicate = (
+                stats["last_payload"] == payload
+                and now - stats["last_time"] <= 0.25
             )
+            if duplicate:
+                stats["duplicates"] += 1
+            stats["last_payload"] = payload
+            stats["last_time"] = now
+
+            current_session = self._ble_diag_active_session
+            stale = client is not self._client or session != current_session
+            if stale:
+                stats["stale"] += 1
+
+            # Limit diagnostic log volume while still exposing progression.
+            calls = stats["calls"]
+            report = (
+                calls <= 3 or calls in (10, 25, 50, 100)
+                or calls % 250 == 0
+                or (duplicate and stats["duplicates"] in (1, 10, 50, 100))
+                or (stale and stats["stale"] in (1, 10, 50, 100))
+            )
+            if report:
+                _LOGGER.warning(
+                    "%s: BLE_DIAG notify CALLBACK session=%s client=%s "
+                    "active_session=%s active_client=%s calls=%s "
+                    "duplicates_250ms=%s stale=%s repeat=%s "
+                    "stale_call=%s fragment=%s payload_len=%s",
+                    self.address, session, stats["client_id"],
+                    current_session,
+                    f"0x{id(self._client):x}" if self._client else "none",
+                    calls, stats["duplicates"], stats["stale"],
+                    duplicate, stale, payload[0] if payload else "empty",
+                    len(payload),
+                )
+            # Diagnostic mode: preserve the existing packet-processing path.
+            self._notification_handler(sender, data)
+
+        return traced_notification
+
+    def _ble_diag_close_session(
+        self, client: BleakClientWithServiceCache | None, reason: str
+    ) -> None:
+        """Emit a summary for any session(s) tied to this Bleak client."""
+        if client is None:
             return
+        client_id = f"0x{id(client):x}"
+        for session, stats in self._ble_diag_sessions.items():
+            if stats["client_id"] != client_id or stats.get("closed"):
+                continue
+            stats["closed"] = True
+            _LOGGER.warning(
+                "%s: BLE_DIAG notify CLOSE session=%s client=%s reason=%s "
+                "calls=%s duplicates_250ms=%s stale=%s",
+                self.address, session, client_id, reason,
+                stats["calls"], stats["duplicates"], stats["stale"],
+            )
+        if self._ble_diag_active_session is not None:
+            active_stats = self._ble_diag_sessions.get(self._ble_diag_active_session)
+            if active_stats and active_stats["client_id"] == client_id:
+                self._ble_diag_active_session = None
+
+    def _schedule_client_cleanup(
+        self, client: BleakClientWithServiceCache, reason: str
+    ) -> None:
+        """Schedule one asynchronous D-Bus close for any abandoned client.
+
+        This is synchronous so it is safe to call from Bleak's disconnect
+        callback and from _invalidate_connection() without awaiting D-Bus IO.
+        """
+        if client in self._closed_ble_clients:
+            return
+        if client in self._scheduled_client_cleanups:
+            return
+
+        task = asyncio.create_task(self._close_client_bus(client, reason))
+        self._scheduled_client_cleanups[client] = task
+        self._disconnect_cleanup_tasks.add(task)
+        _LOGGER.warning(
+            "%s: BLE_CLEANUP scheduled old client=0x%x reason=%s",
+            self.address, id(client), reason,
+        )
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._disconnect_cleanup_tasks.discard(completed)
+            if self._scheduled_client_cleanups.get(client) is completed:
+                self._scheduled_client_cleanups.pop(client, None)
+            if not completed.cancelled():
+                try:
+                    completed.result()
+                except Exception:
+                    _LOGGER.exception(
+                        "%s: BLE_CLEANUP task failed old client=0x%x",
+                        self.address, id(client),
+                    )
+
+        task.add_done_callback(finished)
+
+    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
+        """Release even a client invalidated before BlueZ's callback arrives."""
+        self._ble_diag_close_session(client, "BlueZ disconnected callback")
+        # A stale callback must never invalidate or disconnect the NEW client;
+        # it may, however, close its OWN old per-session D-Bus connection.
+        self._schedule_client_cleanup(client, "BlueZ disconnected callback")
+
         if client is not self._client:
             _LOGGER.debug(
-                "%s: Ignoring disconnect callback from a stale BLE client",
-                self.address,
+                "%s: BLE callback for an already invalidated/stale client=0x%x",
+                self.address, id(client),
             )
             return
 
         was_paired = self._is_paired
         self._invalidate_connection(
-            "BLE device unexpectedly disconnected",
-            client,
+            "BLE device unexpectedly disconnected", client
         )
+        if was_paired and not self._expected_disconnect:
+            # _ensure_connected() waits for queued D-Bus closes before
+            # establishing the next BLE session.
+            self._schedule_reconnect()
 
-        if self._expected_disconnect:
-            _LOGGER.debug(
-                "%s: Disconnected from device; RSSI: %s",
-                self.address,
-                self.rssi,
-            )
-            return
-
-        _LOGGER.debug(
-            "%s: Device unexpectedly disconnected; RSSI: %s",
-            self.address,
-            self.rssi,
-        )
-        if was_paired:
-            _LOGGER.debug(
-                "%s: Scheduling reconnect; RSSI: %s",
-                self.address,
-                self.rssi,
-            )
-            asyncio.create_task(self._reconnect())
+    async def _wait_for_disconnected_cleanups(self) -> None:
+        """Wait for queued old-client closes before creating a new BLE client."""
+        pending = [
+            task for task in self._disconnect_cleanup_tasks if not task.done()
+        ]
+        if pending:
+            await asyncio.gather(*pending)
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -590,60 +744,85 @@ class TuyaBLEDevice:
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True
+            self._ble_diag_close_session(client, "integration stop")
             self._invalidate_connection("Disconnected from BLE device", client)
-            if client and client.is_connected:
-                try:
-                    await client.stop_notify(CHARACTERISTIC_NOTIFY)
-                except BLEAK_EXCEPTIONS:
-                    _LOGGER.debug(
-                        "%s: stop_notify failed during shutdown",
-                        self.address,
-                        exc_info=True,
-                    )
-                try:
-                    await client.disconnect()
-                except BLEAK_EXCEPTIONS:
-                    _LOGGER.debug(
-                        "%s: disconnect failed during shutdown",
-                        self.address,
-                        exc_info=True,
-                    )
+            if client is not None:
+                if client.is_connected:
+                    try:
+                        await client.stop_notify(CHARACTERISTIC_NOTIFY)
+                    except BLEAK_EXCEPTIONS:
+                        _LOGGER.debug(
+                            "%s: stop_notify failed during shutdown",
+                            self.address,
+                            exc_info=True,
+                        )
+                await self._close_client_bus(client, "integration stop")
+        await self._wait_for_disconnected_cleanups()
         async with self._seq_num_lock:
             self._current_seq_num = 1
 
-    async def _ensure_connected(self) -> None:
-        """Ensure connection to device is established."""
-        global global_connect_lock
-        if self._expected_disconnect:
+    async def _close_client_bus(
+        self, client: BleakClientWithServiceCache, reason: str
+    ) -> None:
+        """Close a Bleak D-Bus bus once, even after the BLE link has dropped."""
+        if client in self._closed_ble_clients:
             return
-        if self._connect_lock.locked():
-            _LOGGER.debug(
-                "%s: Connection already in progress,"
-                " waiting for it to complete; RSSI: %s",
-                self.address,
-                self.rssi,
-            )
-        if self._client and self._client.is_connected and self._is_paired:
+        task = self._client_close_tasks.get(client)
+        if task is None:
+            async def close() -> None:
+                try:
+                    # This must not be guarded by client.is_connected: Bleak's
+                    # disconnect() also closes the per-session D-Bus bus.
+                    await asyncio.wait_for(client.disconnect(), DISCONNECT_TIMEOUT)
+                    self._closed_ble_clients.add(client)
+                    _LOGGER.warning(
+                        "%s: BLE_CLEANUP closed old client=0x%x reason=%s",
+                        self.address, id(client), reason,
+                    )
+                except Exception:
+                    _LOGGER.warning(
+                        "%s: BLE_CLEANUP failed old client=0x%x reason=%s",
+                        self.address, id(client), reason, exc_info=True,
+                    )
+
+            task = asyncio.create_task(close())
+            self._client_close_tasks[client] = task
+            def done(completed: asyncio.Task[None]) -> None:
+                if self._client_close_tasks.get(client) is completed:
+                    self._client_close_tasks.pop(client, None)
+            task.add_done_callback(done)
+        await asyncio.shield(task)
+
+    async def _release_failed_client(
+        self, client: BleakClientWithServiceCache, reason: str
+    ) -> None:
+        """Release both the physical connection and Bleak's D-Bus session."""
+        self._ble_diag_close_session(client, reason)
+        if self._client is client:
+            self._invalidate_connection(reason, client)
+        await self._close_client_bus(client, reason)
+
+    async def _ensure_connected(self) -> None:
+        """Connect with bounded retries and release failed sessions before retry."""
+        if self._expected_disconnect or self.is_connected:
             return
         async with self._connect_lock:
-            # Check again while holding the lock
-            await asyncio.sleep(0.01)
-            if self._client and self._client.is_connected and self._is_paired:
+            if self._expected_disconnect or self.is_connected:
                 return
-            attempts_count = 100
-            while attempts_count > 0:
-                attempts_count -= 1
-                if attempts_count == 0:
-                    _LOGGER.error(
-                        "%s: Connecting, all attempts failed; RSSI: %s",
-                        self.address,
-                        self.rssi,
-                    )
-                    raise BleakNotFoundError()
+            await self._wait_for_disconnected_cleanups()
+            if self._expected_disconnect or self.is_connected:
+                return
+            last_error: Exception | None = None
+            for attempt in range(1, CONNECT_ATTEMPTS + 1):
+                if self._expected_disconnect:
+                    return
+                client: BleakClientWithServiceCache | None = None
+                success = False
                 try:
                     async with global_connect_lock:
                         _LOGGER.debug(
-                            "%s: Connecting; RSSI: %s", self.address, self.rssi
+                            "%s: Connecting attempt %s/%s; RSSI: %s",
+                            self.address, attempt, CONNECT_ATTEMPTS, self.rssi,
                         )
                         client = await establish_connection(
                             BleakClientWithServiceCache,
@@ -653,122 +832,77 @@ class TuyaBLEDevice:
                             use_services_cache=True,
                             ble_device_callback=lambda: self._ble_device,
                         )
-                except BleakNotFoundError:
-                    _LOGGER.error(
-                        "%s: device not found, not in range, or poor RSSI: %s",
-                        self.address,
-                        self.rssi,
-                        exc_info=True,
-                    )
-                    continue
-                except BLEAK_EXCEPTIONS:
-                    _LOGGER.debug(
-                        "%s: communication failed", self.address, exc_info=True
-                    )
-                    continue
-                except:
-                    _LOGGER.debug("%s: unexpected error",
-                                  self.address, exc_info=True)
-                    continue
-
-                if client and client.is_connected:
-                    _LOGGER.debug("%s: Connected; RSSI: %s",
-                                  self.address, self.rssi)
+                    if self._expected_disconnect:
+                        return
+                    if not client.is_connected:
+                        raise BleakError("BLE connection was not established")
                     self._client = client
+                    self._is_paired = False
+                    notify_callback = self._ble_diag_register_notify(client)
                     try:
-                        await self._client.start_notify(
-                            CHARACTERISTIC_NOTIFY, self._notification_handler
+                        await client.start_notify(
+                            CHARACTERISTIC_NOTIFY, notify_callback
                         )
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: starting notifications failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
-                    continue
-
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug(
-                        "%s: Sending device info request", self.address)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_DEVICE_INFO,
-                            bytes(0),
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending device info request failed",
-                                self.address,
-                            )
-                            continue
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: Sending device info request failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
-                    continue
-
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug("%s: Sending pairing request", self.address)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_PAIR,
-                            self._build_pairing_request(),
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending pairing request failed",
-                                self.address,
-                            )
-                            continue
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: Sending pairing request failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
-                    continue
-
-                break
-
-        if self._client:
-            if self._client.is_connected:
-                if self._is_paired:
-                    _LOGGER.debug("%s: Successfully connected", self.address)
+                    except BaseException:
+                        self._ble_diag_close_session(client, "start_notify failed")
+                        raise
+                    _LOGGER.warning(
+                        "%s: BLE_DIAG notify STARTED session=%s client=0x%x",
+                        self.address, self._ble_diag_active_session, id(client),
+                    )
+                    if not await self._send_packet_while_connected(
+                        TuyaBLECode.FUN_SENDER_DEVICE_INFO, bytes(0), 0, True
+                    ):
+                        raise BleakError("Device info response timed out")
+                    if not await self._send_packet_while_connected(
+                        TuyaBLECode.FUN_SENDER_PAIR,
+                        self._build_pairing_request(), 0, True,
+                    ):
+                        raise BleakError("Pairing response timed out")
+                    if not self.is_connected:
+                        raise BleakError("Pairing was not completed")
+                    success = True
                     self._fire_connected_callbacks()
-                else:
-                    _LOGGER.error("%s: Connected but not paired", self.address)
-            else:
-                _LOGGER.error("%s: Not connected", self.address)
-        else:
-            _LOGGER.error("%s: No client device", self.address)
+                    _LOGGER.debug("%s: Connected and paired", self.address)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:
+                    last_error = err
+                    _LOGGER.warning(
+                        "%s: BLE connection attempt %s/%s failed: %s",
+                        self.address, attempt, CONNECT_ATTEMPTS, err,
+                    )
+                finally:
+                    if client is not None and not success:
+                        await self._release_failed_client(
+                            client, "BLE connection initialization failed"
+                        )
+                if attempt < CONNECT_ATTEMPTS and not self._expected_disconnect:
+                    await asyncio.sleep(CONNECT_RETRY_DELAY)
+            raise BleakError(
+                f"BLE connection failed after {CONNECT_ATTEMPTS} attempts: {last_error}"
+            )
 
     async def _reconnect(self) -> None:
-        """Attempt a reconnect"""
-        _LOGGER.debug("%s: Reconnect, ensuring connection", self.address)
+        """A single reconnect worker with bounded backoff and clean shutdown."""
         async with self._seq_num_lock:
             self._current_seq_num = 1
-        try:
-            if self._expected_disconnect:
-                return
-            await self._ensure_connected()
-            if self._expected_disconnect:
-                return
-            _LOGGER.debug("%s: Reconnect, connection ensured", self.address)
-        except BLEAK_EXCEPTIONS:  # BleakNotFoundError:
-            _LOGGER.debug(
-                "%s: Reconnect, failed to ensure connection - backing off",
-                self.address,
-                exc_info=True,
-            )
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            _LOGGER.debug("%s: Reconnecting again", self.address)
-            asyncio.create_task(self._reconnect())
+        delay = max(float(BLEAK_BACKOFF_TIME), 3.0)
+        while not self._expected_disconnect:
+            try:
+                await self._ensure_connected()
+                if self.is_connected or self._expected_disconnect:
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.debug(
+                    "%s: Reconnect failed; retrying in %.0f seconds",
+                    self.address, delay, exc_info=True,
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -881,23 +1015,36 @@ class TuyaBLEDevice:
         if self._expected_disconnect:
             return
 
-        for attempt in range(SEND_RETRY_ATTEMPTS):
+        # Never automatically repeat a physical lock command after an ambiguous
+        # GATT failure: it may already have been executed by the lock.
+        attempts = (
+            SEND_RETRY_ATTEMPTS
+            if code == TuyaBLECode.FUN_SENDER_DEVICE_STATUS else 1
+        )
+        for attempt in range(attempts):
             try:
                 await self._ensure_connected()
                 if self._expected_disconnect:
                     return
                 if not self.is_connected:
                     raise BleakError("BLE client is not connected and paired")
-                await self._send_packet_while_connected(
+                result = await self._send_packet_while_connected(
                     code, data, 0, wait_for_response
                 )
+                if not result:
+                    raise BleakError(f"No response to {code.name}")
                 return
             except BLEAK_EXCEPTIONS as err:
-                self._invalidate_connection(
-                    f"BLE command {code.name} failed: {err}",
-                    self._client,
-                )
-                if attempt + 1 >= SEND_RETRY_ATTEMPTS:
+                failed_client = self._client
+                if failed_client is not None:
+                    await self._release_failed_client(
+                        failed_client, f"BLE command {code.name} failed: {err}"
+                    )
+                else:
+                    self._invalidate_connection(
+                        f"BLE command {code.name} failed: {err}"
+                    )
+                if attempt + 1 >= attempts:
                     raise
                 _LOGGER.debug(
                     "%s: Retrying logical command %s after connection reset "
@@ -905,7 +1052,7 @@ class TuyaBLEDevice:
                     self.address,
                     code.name,
                     attempt + 1,
-                    SEND_RETRY_ATTEMPTS - 1,
+                    attempts - 1,
                     self.rssi,
                 )
                 await asyncio.sleep(BLEAK_BACKOFF_TIME)
