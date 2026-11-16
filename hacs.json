@@ -1,0 +1,6 @@
+{
+  "name": "Tuya Local BLE Lock",
+  "homeassistant": "2026.11.0",
+  "render_readme": true,
+  "country": "RU"
+}
