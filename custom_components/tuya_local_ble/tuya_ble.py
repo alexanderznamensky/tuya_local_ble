@@ -578,7 +578,7 @@ class TuyaBLEDevice:
         }
         self._ble_diag_sessions[session] = stats
         self._ble_diag_active_session = session
-        _LOGGER.warning(
+        _LOGGER.debug(
             "%s: BLE_DIAG notify REGISTER session=%s client=%s "
             "total_registrations=%s",
             self.address, session, stats["client_id"],
@@ -612,7 +612,7 @@ class TuyaBLEDevice:
                 or (stale and stats["stale"] in (1, 10, 50, 100))
             )
             if report:
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "%s: BLE_DIAG notify CALLBACK session=%s client=%s "
                     "active_session=%s active_client=%s calls=%s "
                     "duplicates_250ms=%s stale=%s repeat=%s "
@@ -640,7 +640,7 @@ class TuyaBLEDevice:
             if stats["client_id"] != client_id or stats.get("closed"):
                 continue
             stats["closed"] = True
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "%s: BLE_DIAG notify CLOSE session=%s client=%s reason=%s "
                 "calls=%s duplicates_250ms=%s stale=%s",
                 self.address, session, client_id, reason,
@@ -667,7 +667,7 @@ class TuyaBLEDevice:
         task = asyncio.create_task(self._close_client_bus(client, reason))
         self._scheduled_client_cleanups[client] = task
         self._disconnect_cleanup_tasks.add(task)
-        _LOGGER.warning(
+        _LOGGER.debug(
             "%s: BLE_CLEANUP scheduled old client=0x%x reason=%s",
             self.address, id(client), reason,
         )
@@ -775,7 +775,7 @@ class TuyaBLEDevice:
                     # disconnect() also closes the per-session D-Bus bus.
                     await asyncio.wait_for(client.disconnect(), DISCONNECT_TIMEOUT)
                     self._closed_ble_clients.add(client)
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "%s: BLE_CLEANUP closed old client=0x%x reason=%s",
                         self.address, id(client), reason,
                     )
@@ -829,7 +829,7 @@ class TuyaBLEDevice:
                             self._ble_device,
                             self.address,
                             self._disconnected,
-                            use_services_cache=True,
+                            use_services_cache=False,
                             ble_device_callback=lambda: self._ble_device,
                         )
                     if self._expected_disconnect:
@@ -846,7 +846,7 @@ class TuyaBLEDevice:
                     except BaseException:
                         self._ble_diag_close_session(client, "start_notify failed")
                         raise
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "%s: BLE_DIAG notify STARTED session=%s client=0x%x",
                         self.address, self._ble_diag_active_session, id(client),
                     )
